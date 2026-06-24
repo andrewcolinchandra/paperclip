@@ -27,6 +27,7 @@ const mockCompanySkillService = vi.hoisted(() => ({
   deleteComment: vi.fn(),
   importFromSource: vi.fn(),
   installFromCatalog: vi.fn(),
+  updateSkill: vi.fn(),
   deleteSkill: vi.fn(),
 }));
 
@@ -255,6 +256,38 @@ describe("company skill mutation permissions", () => {
         contentHash: "sha256:abc",
       },
       warnings: [],
+    });
+    mockCompanySkillService.updateSkill.mockResolvedValue({
+      id: "skill-1",
+      companyId: "company-1",
+      key: "company/company-1/review",
+      slug: "review",
+      name: "Review",
+      description: null,
+      markdown: "# Review",
+      sourceType: "local_path",
+      sourceLocator: "/tmp/review",
+      sourceRef: null,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      iconUrl: null,
+      color: null,
+      tagline: null,
+      authorName: null,
+      homepageUrl: null,
+      categories: ["memory", "review"],
+      sharingScope: "company",
+      publicShareToken: null,
+      forkedFromSkillId: null,
+      forkedFromCompanyId: null,
+      starCount: 0,
+      installCount: 1,
+      forkCount: 0,
+      currentVersionId: null,
+      metadata: null,
+      createdAt: new Date("2026-05-26T00:00:00.000Z"),
+      updatedAt: new Date("2026-05-26T00:01:00.000Z"),
     });
     mockCompanySkillService.deleteSkill.mockResolvedValue({
       id: "skill-1",
@@ -608,6 +641,38 @@ describe("company skill mutation permissions", () => {
 
     await request(app).get("/api/companies/company-1/skills/categories").expect(200);
     expect(mockCompanySkillService.categoryCounts).toHaveBeenCalledWith("company-1");
+  });
+
+  it("accepts category updates and logs the skill mutation", async () => {
+    const app = await createApp({ type: "board", source: "local_implicit", userId: "user-1" });
+
+    const res = await request(app)
+      .patch("/api/companies/company-1/skills/skill-1")
+      .send({ categories: ["memory", "review"], sharingScope: "company" })
+      .expect(200);
+
+    expect(res.body).toMatchObject({
+      id: "skill-1",
+      categories: ["memory", "review"],
+      sharingScope: "company",
+    });
+    expect(mockCompanySkillService.updateSkill).toHaveBeenCalledWith("company-1", "skill-1", {
+      categories: ["memory", "review"],
+      sharingScope: "company",
+    });
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      companyId: "company-1",
+      actorType: "user",
+      actorId: "user-1",
+      action: "company.skill_updated",
+      entityType: "company_skill",
+      entityId: "skill-1",
+      details: {
+        slug: "review",
+        categories: ["memory", "review"],
+        sharingScope: "company",
+      },
+    }));
   });
 
   it("creates skill versions and logs the mutation", async () => {
