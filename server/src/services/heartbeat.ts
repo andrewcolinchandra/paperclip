@@ -12984,6 +12984,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context.paperclipPreviousSessionId;
     }
 
+    // When there's no task session but we have a session ID from a previous run
+    // (e.g. heartbeat without assigned issue), wrap it into session params so
+    // the adapter can find ctx.runtime.sessionParams.sessionId and pass --resume.
+    if (runtimeSessionParamsForAdapter == null && runtimeSessionIdForAdapter != null) {
+      runtimeSessionParamsForAdapter = { sessionId: runtimeSessionIdForAdapter };
+    }
+
     const runtimeForAdapter = {
       sessionId: runtimeSessionIdForAdapter,
       sessionParams: runtimeSessionParamsForAdapter,
