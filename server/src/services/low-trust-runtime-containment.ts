@@ -1,7 +1,6 @@
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issues } from "@paperclipai/db";
-import { unprocessable } from "../errors.js";
 import type { TrustPresetResolution } from "./trust-preset-resolver.js";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
@@ -9,6 +8,54 @@ import {
 } from "./trust-preset-resolver.js";
 
 export const LOW_TRUST_RUNTIME_MANAGEMENT_TOOL_CLASS = "runtime.manage";
+
+// A low-trust boundary refusing content is *expected, defensive behavior*, not a
+// crash. Surfacing it as a typed failure (instead of a raw 422) lets the run-setup
+// path route the deny to a graceful issue transition (blocked + CEO surface) and
+// keep the agent healthy, rather than pinning it to status=error. See TES-1103.
+export const LOW_TRUST_DENIAL_FAILURE_CODE = "low_trust_denied";
+
+export class LowTrustDenialFailure extends Error {
+  code = LOW_TRUST_DENIAL_FAILURE_CODE;
+  /** Specific boundary reason, e.g. `missing_low_trust_boundary_scope`. */
+  denyCode: string;
+  /** Trust-policy source that produced the denial, when known. */
+  denySource: string | null;
+
+  constructor(message: string, denyCode: string, denySource: string | null = null) {
+    super(message);
+    this.name = "LowTrustDenialFailure";
+    this.denyCode = denyCode;
+    this.denySource = denySource;
+  }
+}
+
+export function isLowTrustDenialFailure(error: unknown): error is LowTrustDenialFailure {
+  return error instanceof LowTrustDenialFailure;
+}
+
+function raiseLowTrustDenial(message: string, denyCode: string, denySource: string | null = null): never {
+  throw new LowTrustDenialFailure(message, denyCode, denySource);
+}
+
+export interface LowTrustDenial {
+  kind: "denied";
+  reason: string;
+  detail: string;
+  source: string | null;
+}
+
+export function getLowTrustDenial(resolution: TrustPresetResolution): LowTrustDenial | null {
+  if (resolution.kind === "denied") {
+    return {
+      kind: "denied",
+      reason: resolution.reason,
+      detail: resolution.detail,
+      source: resolution.source,
+    };
+  }
+  return null;
+}
 
 export function isLowTrustRuntimeManagementAllowed(resolution: TrustPresetResolution) {
   return resolution.kind === "low_trust_review" &&
@@ -49,23 +96,23 @@ export async function assertLowTrustWorkspaceIsolation(input: {
   selectedEnvironmentDriver: string | null | undefined;
   issue: { companyId: string; id?: string | null; projectId?: string | null } | null;
 }) {
-  if (input.resolution.kind === "denied") {
-    throw unprocessable(input.resolution.detail, {
-      code: input.resolution.reason,
-      source: input.resolution.source,
-    });
+  const denial = getLowTrustDenial(input.resolution);
+  if (denial) {
+    raiseLowTrustDenial(denial.detail, denial.reason, denial.source);
   }
   if (input.resolution.kind !== "low_trust_review") return;
 
   if (!input.isolatedWorkspacesEnabled) {
-    throw unprocessable("Low-trust execution requires isolated workspaces to be enabled.", {
-      code: "low_trust_isolation_unavailable",
-    });
+    raiseLowTrustDenial(
+      "Low-trust execution requires isolated workspaces to be enabled.",
+      "low_trust_isolation_unavailable",
+    );
   }
   if (input.effectiveExecutionWorkspaceMode !== "isolated_workspace") {
-    throw unprocessable("Low-trust execution requires an isolated execution workspace.", {
-      code: "low_trust_requires_isolated_workspace",
-    });
+    raiseLowTrustDenial(
+      "Low-trust execution requires an isolated execution workspace.",
+      "low_trust_requires_isolated_workspace",
+    );
   }
   if (
     !input.issue ||
@@ -75,14 +122,16 @@ export async function assertLowTrustWorkspaceIsolation(input: {
       issue: input.issue,
     }))
   ) {
-    throw unprocessable("Low-trust execution issue is outside the active trust boundary.", {
-      code: "low_trust_boundary_mismatch",
-    });
+    raiseLowTrustDenial(
+      "Low-trust execution issue is outside the active trust boundary.",
+      "low_trust_boundary_mismatch",
+    );
   }
   if (input.selectedEnvironmentDriver !== "sandbox") {
-    throw unprocessable("Low-trust execution requires a sandbox environment driver.", {
-      code: "low_trust_requires_sandbox_environment",
-    });
+    raiseLowTrustDenial(
+      "Low-trust execution requires a sandbox environment driver.",
+      "low_trust_requires_sandbox_environment",
+    );
   }
 }
 
@@ -90,16 +139,15 @@ export function assertLowTrustRuntimeServicesAllowed(input: {
   resolution: TrustPresetResolution;
   runtimeServiceCount: number;
 }) {
-  if (input.resolution.kind === "denied") {
-    throw unprocessable(input.resolution.detail, {
-      code: input.resolution.reason,
-      source: input.resolution.source,
-    });
+  const denial = getLowTrustDenial(input.resolution);
+  if (denial) {
+    raiseLowTrustDenial(denial.detail, denial.reason, denial.source);
   }
   if (input.resolution.kind !== "low_trust_review") return;
   if (input.runtimeServiceCount === 0) return;
   if (isLowTrustRuntimeManagementAllowed(input.resolution)) return;
-  throw unprocessable("Low-trust execution cannot start runtime services unless the boundary grants runtime.manage.", {
-    code: "low_trust_runtime_services_denied",
-  });
+  raiseLowTrustDenial(
+    "Low-trust execution cannot start runtime services unless the boundary grants runtime.manage.",
+    "low_trust_runtime_services_denied",
+  );
 }

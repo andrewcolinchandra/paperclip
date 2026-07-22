@@ -268,8 +268,12 @@ import {
   type HotRestartReportRun,
 } from "./hot-restart.js";
 import {
+  LOW_TRUST_DENIAL_FAILURE_CODE,
+  LowTrustDenialFailure,
   assertLowTrustRuntimeServicesAllowed,
   assertLowTrustWorkspaceIsolation,
+  getLowTrustDenial,
+  isLowTrustDenialFailure,
 } from "./low-trust-runtime-containment.js";
 import { resolveCoreTrustPreset, type TrustPresetResolution } from "./trust-preset-resolver.js";
 import {
@@ -346,6 +350,7 @@ const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
+const LOW_TRUST_DENIAL_RECOVERY_CAUSE = "low_trust_denied";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON = "execution_review_participant_recovery";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
@@ -1251,9 +1256,14 @@ export async function preflightLowTrustWorkspaceIsolation(input: {
   effectiveExecutionWorkspaceMode: string | null | undefined;
   issue: { companyId: string; id?: string | null; projectId?: string | null } | null;
   resolveSelectedEnvironmentDriver: () => Promise<string | null | undefined>;
-}): Promise<string | null> {
+}): Promise<string | null | import("./low-trust-runtime-containment.js").LowTrustDenial> {
   if (input.trustPreset.kind !== "denied" && input.trustPreset.kind !== "low_trust_review") {
     return null;
+  }
+
+  const denial = getLowTrustDenial(input.trustPreset);
+  if (denial) {
+    return denial;
   }
 
   const selectedEnvironmentDriver =
@@ -1281,7 +1291,11 @@ export async function resolveWorkspaceAfterLowTrustPreflight<TWorkspace>(input: 
   issue: { companyId: string; id?: string | null; projectId?: string | null } | null;
   resolveSelectedEnvironmentDriver: () => Promise<string | null | undefined>;
   resolveWorkspace: () => Promise<TWorkspace>;
-}): Promise<{ selectedEnvironmentDriver: string | null; workspace: TWorkspace }> {
+}): Promise<{
+  selectedEnvironmentDriver: string | null;
+  workspace: TWorkspace;
+  denial: import("./low-trust-runtime-containment.js").LowTrustDenial | null;
+}> {
   const selectedEnvironmentDriver = await preflightLowTrustWorkspaceIsolation({
     db: input.db,
     trustPreset: input.trustPreset,
@@ -1291,9 +1305,18 @@ export async function resolveWorkspaceAfterLowTrustPreflight<TWorkspace>(input: 
     resolveSelectedEnvironmentDriver: input.resolveSelectedEnvironmentDriver,
   });
 
+  if (typeof selectedEnvironmentDriver === "object" && selectedEnvironmentDriver !== null) {
+    return {
+      selectedEnvironmentDriver: null,
+      workspace: await input.resolveWorkspace(),
+      denial: selectedEnvironmentDriver,
+    };
+  }
+
   return {
-    selectedEnvironmentDriver,
+    selectedEnvironmentDriver: selectedEnvironmentDriver ?? null,
     workspace: await input.resolveWorkspace(),
+    denial: null,
   };
 }
 
@@ -1430,6 +1453,12 @@ export function isConfigurationIncompleteFailedRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
 ) {
   return run?.errorCode === CONFIGURATION_INCOMPLETE_FAILURE_CODE || run?.errorCode === "model_not_found";
+}
+
+function isLowTrustDenialFailedRun(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode"> | null | undefined,
+) {
+  return run?.errorCode === LOW_TRUST_DENIAL_FAILURE_CODE;
 }
 
 async function hasGitMetadata(cwd: string | null | undefined) {
@@ -12373,6 +12402,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const {
       selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
       workspace: resolvedWorkspace,
+      denial: lowTrustDenial,
     } = await resolveWorkspaceAfterLowTrustPreflight({
       db,
       trustPreset,
@@ -12401,6 +12431,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
         ),
     });
+
+    if (lowTrustDenial) {
+      throw new LowTrustDenialFailure(lowTrustDenial.detail, lowTrustDenial.reason, lowTrustDenial.source);
+    }
     const hostExecutionWorkspaceConfig = stripHostWorkspaceProvisionForLowTrustSandbox({
       config: mergedConfig,
       trustPreset,
@@ -14128,11 +14162,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // recovery path routes it to a human owner instead of looping retries.
           const workspaceValidationSetupFailure = isWorkspaceValidationFailure(outerErr) ? outerErr : null;
           const configurationIncompleteSetupFailure = isConfigurationIncompleteFailure(outerErr) ? outerErr : null;
+          // A low-trust boundary deny is expected defensive behavior, not a crash:
+          // route it to its own errorCode so recovery transitions the issue to blocked
+          // (with a CEO surface) and the agent stays idle instead of being pinned to error.
+          const lowTrustDenialSetupFailure = isLowTrustDenialFailure(outerErr) ? outerErr : null;
           const recordedResponsibleUserDenialCode =
             normalizeResponsibleUserDenialCode((await getRun(runId).catch(() => null))?.errorCode);
           const setupFailureErrorCode =
             workspaceValidationSetupFailure?.code ??
             configurationIncompleteSetupFailure?.code ??
+            lowTrustDenialSetupFailure?.code ??
             recordedResponsibleUserDenialCode ??
             "setup_failed";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
@@ -14214,7 +14253,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // path owned the terminal transition. If another path already finalized
           // the run, keep that terminal outcome authoritative.
           if (setupFailureWrite.updated) {
-            await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
+            await finalizeAgentStatus(
+              run.agentId,
+              "failed",
+              message,
+              // A low-trust deny is a policy refusal, not an agent malfunction: keep
+              // the agent idle (not error) so it stays usable for other work.
+              { keepIdleOnFailure: Boolean(lowTrustDenialSetupFailure) },
+            ).catch(() => undefined);
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
@@ -14322,6 +14368,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       "Paperclip stopped before dispatching the adapter because required secret/env bindings are missing. " +
       `Resolving them as a runtime failure would only produce repeated opaque setup failures.${failureSummary ?? ""} ` +
       "Moving it to `blocked` with a source-scoped recovery action so an operator can bind the missing secret(s) before resuming."
+    );
+  }
+
+  function buildLowTrustDenialRecoveryComment(input: {
+    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+  }) {
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    return (
+      "Paperclip stopped before dispatching the adapter because the active low-trust boundary denied this run " +
+      `(expected defensive behavior, not a crash).${failureSummary ?? ""} ` +
+      "The agent is left healthy (idle). Moving the issue to `blocked` with a source-scoped recovery action so the " +
+      "trust-boundary scope, isolation, or sandbox driver can be reconciled before resuming."
     );
   }
 
@@ -14928,33 +14986,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      const lowTrustDenial = isLowTrustDenialFailedRun(run);
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
+        lowTrustDenial ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
       if (shouldBlockImmediately) {
         const workspaceValidationFailure = isWorkspaceValidationFailedRun(run);
         const configurationIncompleteFailure = isConfigurationIncompleteFailedRun(run);
-        const comment = workspaceValidationFailure
-          ? buildWorkspaceValidationRecoveryComment({ latestRun: run })
-          : configurationIncompleteFailure
-            ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
-            : buildImmediateExecutionPathRecoveryComment({
-                status: issue.status as "todo" | "in_progress",
-                latestRun: run,
-              });
+        const comment = lowTrustDenial
+          ? buildLowTrustDenialRecoveryComment({ latestRun: run })
+          : workspaceValidationFailure
+            ? buildWorkspaceValidationRecoveryComment({ latestRun: run })
+            : configurationIncompleteFailure
+              ? buildConfigurationIncompleteRecoveryComment({ latestRun: run })
+              : buildImmediateExecutionPathRecoveryComment({
+                  status: issue.status as "todo" | "in_progress",
+                  latestRun: run,
+                });
         return {
           kind: "blocked" as const,
           issue,
           previousStatus: issue.status,
           comment,
-          recoveryCause: workspaceValidationFailure
-            ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
-            : configurationIncompleteFailure
-              ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : undefined,
+          recoveryCause: lowTrustDenial
+            ? LOW_TRUST_DENIAL_RECOVERY_CAUSE
+            : workspaceValidationFailure
+              ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
+              : configurationIncompleteFailure
+                ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
+                : undefined,
         };
       }
 
@@ -15065,8 +15129,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
             : promotionResult.recoveryCause === CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
               ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : promotionResult.recoveryCause === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
-                ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
+              : promotionResult.recoveryCause === LOW_TRUST_DENIAL_RECOVERY_CAUSE
+                ? LOW_TRUST_DENIAL_RECOVERY_CAUSE
+                : promotionResult.recoveryCause === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
+                  ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
               : undefined,
         recoveryOwnerAgentId: promotionResult.recoveryOwnerAgentId,
       });
